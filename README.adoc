@@ -1,0 +1,184 @@
+= CDC Synchronization of PostgreSQL and Elasticsearch with Spring Boot
+
+*Motivation*
+
+Some colleagues  of mine  use database and _Elasticsearch_(_ELK_)  together where the database is the main data source, and _ELK_ is the search facade: the data is first stored in the database, and then the changes are written to the index.
+
+Here is a typical example of such code that uses _Spring Data_:
+
+    @Override
+    @Transactional
+    public ProductDto update(ProductDto dto) {
+        var jpaEntity = jpaRepository.save(dto2jpa(Objects.requireNonNull(dto)));
+        var elkEntity = elkRepository.save(jpa2elk(jpaEntity));
+        return elk2dto(elkEntity);
+    }
+
+Unfortunately, this approach does not guarantee the consistency of the database and the index, not only permanently, but also with a delay. Namely, there may be such a moment that the state of the database at that moment will not correspond to the state of the index at any moment. And vice versa. In particular, some changes in the database may never reach the index.
+
+Since I've seen code similar to the above in several projects, I thought a little project showing how sync could be done would be helpful.
+
+Thid is an example of such a _Java_ project using _Postgresql_ _CDC_(Change Data Capture), _Elasticsearch_, _String Boot_, _String Data_(_JPA_, _Elasticsearch_). The project does not use any external components such as _Kafka_, etc. Only the ones listed. There are ten classes in total.
+
+Below are brief comments on the project that do not fit into the self-describing code paradigm.
+
+*Brief digression*
+
+We will not touch on what _CDC_(Change Data Capture) is in general and its implementation in PostreSQL in particular. Details can be found at the link
+
+https://www.postgresql.org/docs/current/wal-intro.html[]
+
+Let's just say that this technology allows you to work with _WAL_ (Write-Ahead Logging) , which the database maintains to maintain data integrity and replication. This log records data about changes in the database, grouped by transactions.
+
+The main property of this log that can be used to synchronize the database and index is the following.
+Data in _WAL_ is stored exactly in the order in which it is written to the database. This allows you to write changes to the index exactly in the order in which they were written to the database, and not in the order in which control is transferred from _JPA_ component to _ELK_ one.
+
+Second, _CDC_ implementation differs between database vendors. The project shown uses PostgreSQL.
+
+
+*Configuration*
+
+
+In order to see how the project works, you must first set up the database.
+
+Open some client (_psql_, _DBeaver_, etc) and run the command
+
+`SHOW wal_level;`
+
+If the value is not "_logical_", then you need to execute the command
+
+`ALTER SYSTEM SET wal_level = logical;`
+
+Then you need to restart the db server or container with it ( at least for _PostgreSQL 14_).
+
+After that, open the client, look at the available slots
+
+`SELECT * FROM pg_replication_slots;`
+
+and create a slot with a unique name
+
+``SELECT * FROM pg_create_logical_replication_slot('elk_slot', 'test_decoding', false, true);
+``
+
+The unique name of the slot (in the example '_elk_slot_') can be chosen by yourself.
+
+Let's leave the plugin name ('_test_decoding_') as it is for now.
+
+The rest of the settings can be left unchanged.
+
+In order to return to the previous configuration, you must delete the created slot
+
+`SELECT * FROM pg_drop_replication_slot ( 'elk_slot' );`
+
+restore the previous value of _wal_level_
+
+`ALTER SYSTEM RESET  wal_level;`
+
+and restart the server or the container again.
+
+
+*Project description*
+
+
+To make the project compact, but still fully functional, I limited myself to working with one entity - _Product_, which corresponds to the table of the same name in the database, the index of the same name and three Java classes: _ProductDto_, _JPA_ entity _ProductDB_ and _ELK_ document _ProductELK_.
+
+Two repositories are used to work with the entity
+
+`ProductJPARepository extends JpaRepository<ProductDB, Long>`
+
+``ProductELKRepository extends ElasticsearchRepository<ProductELK,Long>
+``
+
+The _ProductVanillaService_ service works with these repositories. This service does not care about database and index synchronization. The above code is taken from this service.
+
+The controller that works with the service is _ProductController_, which has only _CRUD_ endpoints for brevity.
+
+The methods of the _ProductVanillaService_ service, as you can see from the example, are made transactional so that you can roll back changes in the database if there are problems with saving changes to the index.
+
+If the application is launched with the "_vanilla_" profile, then it will work without synchronization.
+
+In order to enable synchronization, you need to run the application with the “_sync_” profile.
+
+To keep the database and the index in sync _ProductCDCService_ service is used instead of _ProductVanillaService_. The sych version uses the same repositories as the vanilla one.
+
+Here is an example of processing data changes from ProductCDCService, similar to the example given at the beginning of the article.
+
+    @Override
+    @Transactional(propagation= Propagation.NEVER)
+    public ProductDto update(ProductDto dto) {
+        var id = Objects.requireNonNull(Objects.requireNonNull(dto).getId());
+        jpaRepository.save(dto2jpa(dto));
+        processNextCDCChunk();
+        return elkRepository.findById(id).map(ProductMapper::elk2dto).orElse(null);
+    }
+
+Working with the database for the two services is identical. Except that the methods of the first service are transactional and therefore saving data to the index occurs in the same transaction as saving data to the database.
+
+The methods of the _ProductCDCService_ service are not transactional.
+
+Also, the _ProductCDCService_ methods, unlike _ProductVanillaService_, do not store data in the index.
+Instead,  it calls _processNextCDCChunk()_ method, which starts scanning completed transactions from _WAL_.
+
+This method starts its work outside a transaction. The transaction is opened in
+
+`dbRepository.save(dto2db(dto))`
+
+and closed  on  exit from it.
+
+Therefore, by the time _processNextCDCChunk()_ is called, the data saved in the previous step is already in _WAL_ and available for scanning by this method. And, as a result, by the time _processNextCDCChunk()_ ends, this data will already be in the index.
+
+With the next call to elkRepository.findById(id) we get this data from the index and return it to the controller.
+
+Here the next question arises. Does the state of the returned object match the state the object was at call of _update(dto)_? For example, if user A changed the product name to "_prodA_", will the name stay that way in the output?
+The answer to this question is negative.
+The correct answer is the following.
+We return the state of the product at SOME point in time after the database transaction was committed.
+
+Let's take an example.
+Suppose user A renamed the product to "prodA" and user B followed him to "_prodB_".
+If by the time _processNextCDCChunk()_ method of user A  completed  WAL scan, the transaction with user B's change has been committed, then the result of this commit will be included in the scan of user A, and user A's _elkRepository.findById(id)_ will return the product with the value of the field name "_prodB_".
+
+There is nothing strange in this, as it is clear that the state of the database is saved in the index with some delay. The main thing is that all database changes reach the index.
+
+In particular, after successfully saving changes to the database and to the index, we may not return anything to the user. This can happen if, following the changes that we process in client A's transaction, this object is deleted in client B's transaction. And if by the time user A scans  _WAL_, the deletion is already committed, then user A's _processNextCDCChunk()_ will remove the object from the index. In this case, upon return from _processNextCDCChunk()_, this object will no longer be in the index. Unless, of course, some third user C re-createed the deleted product and this productgets into the index by the time _elkRepository.findById(id)_ of user A is called. In this case, we will return the product of user C to the user A, not the product of user A with with the name "_prodA_".
+
+
+
+The _processNextCDCChunk()_ method is simple. It calls the _TestDecodingCDCService.processNextCDCChunk()_ method and handles the exception. It is important to note two points here.
+
+The first is that the method is called asynchronously.
+
+And the second is that the executor that executes the method uses one thread. This ensures that _WAL_ is processed sequentially, and therefore data changes are loaded into the index in exactly the same order as those changes were loaded into the database. Therefore, the state of the index at each moment will correspond to the state of the database at some moment in the past.
+
+
+_TestDecodingCDCService.processNextCDCChunk()_ is the central method. It takes all committed  unprocessed transactions, parses and uploads changes from scanned transactions  into the index.
+
+Uploading changes to the index  (_TransactionOperationProcessor.processOp()_) consists of the following steps:
+
+1. Based on the table name (_TransactionOperation.tableName_) from the transaction operation, determine the _JPA_ entity class that is persisted in this table. If the class is not defined, then the operation is skipped.
+
+2. Based on the _JPA_ class, find the _ELK_ service that processes the entities of this class. This service wraps  _ProductELKRepository_.  _ProductVanillaService_ uses this particular repository to upload _JPA_ entity into the index.  If no such service is found, then the operation is skipped.
+
+3. Using _JPA_, restore the _JPA_ entity by _TransactionOperation.restoreSQLStatement_. Since the operation is associated with a specific table (_TransactionOperation.tableName_), only that part of the entity that is persisted in this table is restored. _JPA_ properties annotated with _@OneToOne_, _@OneToMany_, etc. are not initialized.
+
+4. Upload the restored _JPA_  entity into the index with the service found in step 2.
+
+
+If there are any problems during the processing of operations, you need to fix the problems and re-run _TestDecodingCDCService.processNextCDCChunk()_.
+This can be done because the _ProductELKRepository.save_ and _ProductELKRepository.delete_ are idempotent.
+
+If all scanned transactions are successfully processed, then the corresponding records are removed from _WAL_.
+
+I hope provided information is helpful.
+
+Please contact us if you have any comments, suggestions or questions.
+
+Stay in sync,
+
+Sergey
+
+
+
+
+
+

@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/postgres
+    username: postgres
+    password: mypassword
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    show-sql: true
+
+lombok:
+  fieldDefaults:
+    defaultPrivate: true
+
+logging:
+  level:
+    org.rent.app: DEBUG
